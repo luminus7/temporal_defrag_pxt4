@@ -41,7 +41,17 @@
 #include <sys/statfs.h>
 #include <sys/vfs.h>
 
+#include <pthread.h>  // zgy
+#include "calclock.h"  // zgy
+
 #include "../version.h"
+
+////sysganda
+//# include "calclock.h"
+//unsigned long long call_defrag_time, call_defrag_count;
+//unsigned long long call_time, call_count;
+//unsigned long long get_extent_time, get_extent_count;
+int option = 0;
 
 /* A relatively new ioctl interface ... */
 #ifndef EXT4_IOC_MOVE_EXT
@@ -87,14 +97,17 @@
 /* The mode of defrag */
 #define DETAIL			0x01
 #define STATISTIC		0x02
+// zgy: indicate parallel
+#define PARALLEL		0x04
 
 #define DEVNAME			0
 #define DIRNAME			1
 #define FILENAME		2
-
+#define FILE_PARALLEL		3
 #define FTW_OPEN_FD		2000
-
-#define FS_EXT4			"ext4"
+//sysganda
+#define FS_EXT4			"pxt4"
+//#define FS_EXT4			"ext4"
 #define ROOT_UID		0
 
 #define BOUND_SCORE		55
@@ -102,6 +115,7 @@
 
 /* Magic number for ext4 */
 #define EXT4_SUPER_MAGIC	0xEF53
+#define PXT4_SUPER_MAGIC	0xEF53
 
 /* Definition of flex_bg */
 #define EXT4_FEATURE_INCOMPAT_FLEX_BG		0x0200
@@ -164,12 +178,18 @@ struct frag_statistic_ino {
 	char msg_buffer[PATH_MAX + 1];	/* pathname of the file */
 };
 
+//zgy: for parallel defrag
+struct defrag_target_info{
+  char *f_path;
+  struct stat64 stat;
+};
+
 static char	lost_found_dir[PATH_MAX + 1];
 static int	block_size;
 static int	extents_before_defrag;
 static int	extents_after_defrag;
 static int	mode_flag;
-static unsigned int	current_uid;
+static uid_t	current_uid;
 static unsigned int	defraged_file_count;
 static unsigned int	frag_files_before_defrag;
 static unsigned int	frag_files_after_defrag;
@@ -182,6 +202,10 @@ static __u32 feature_incompat;
 static ext4_fsblk_t	files_block_count;
 static struct frag_statistic_ino	frag_rank[SHOW_FRAG_FILES];
 
+// For parallel defrag
+struct defrag_target_info *target_infos;
+int f_cnt;
+int info_idx;
 
 /*
  * We prefer posix_fadvise64 when available, as it allows 64bit offset on
@@ -207,7 +231,7 @@ static struct frag_statistic_ino	frag_rank[SHOW_FRAG_FILES];
  * @dir_path_len:	the length of directory.
  */
 static int get_mount_point(const char *devname, char *mount_point,
-							int dir_path_len)
+						   int dir_path_len)
 {
 	/* Refer to /etc/mtab */
 	const char	*mtab = MOUNTED;
@@ -242,7 +266,7 @@ static int get_mount_point(const char *devname, char *mount_point,
 		endmntent(fp);
 		if (strcmp(mnt->mnt_type, FS_EXT4) == 0) {
 			strncpy(mount_point, mnt->mnt_dir,
-				dir_path_len);
+					dir_path_len);
 			return 0;
 		}
 		PRINT_ERR_MSG(NGMSG_EXT4);
@@ -282,8 +306,9 @@ static int is_ext4(const char *file, char *devname)
 		PRINT_FILE_NAME(file);
 		return -1;
 	}
-
 	if (fsbuf.f_type != EXT4_SUPER_MAGIC) {
+		if(fsbuf.f_type == EXT4_SUPER_MAGIC) {
+		}	
 		PRINT_ERR_MSG(NGMSG_EXT4);
 		return -1;
 	}
@@ -293,7 +318,6 @@ static int is_ext4(const char *file, char *devname)
 		perror("Couldn't access /etc/mtab");
 		return -1;
 	}
-
 	while ((mnt = getmntent(fp)) != NULL) {
 		if (mnt->mnt_fsname[0] != '/')
 			continue;
@@ -319,6 +343,7 @@ static int is_ext4(const char *file, char *devname)
 	}
 
 	endmntent(fp);
+	printf(" \n %s", mnt_type);
 	if (mnt_type && strcmp(mnt_type, FS_EXT4) == 0) {
 		FREE(mnt_type);
 		return 0;
@@ -327,6 +352,7 @@ static int is_ext4(const char *file, char *devname)
 		PRINT_ERR_MSG(NGMSG_EXT4);
 		return -1;
 	}
+	return 0;
 }
 
 /*
@@ -338,13 +364,37 @@ static int is_ext4(const char *file, char *devname)
  * @ftwbuf:		the pointer of a struct FTW.
  */
 static int calc_entry_counts(const char *file EXT2FS_ATTR((unused)),
-		const struct stat64 *buf, int flag EXT2FS_ATTR((unused)),
-		struct FTW *ftwbuf EXT2FS_ATTR((unused)))
+							 const struct stat64 *buf, int flag EXT2FS_ATTR((unused)),
+							 struct FTW *ftwbuf EXT2FS_ATTR((unused)))
 {
 	if (S_ISREG(buf->st_mode))
 		regular_count++;
 
 	total_count++;
+
+	return 0;
+}
+
+/*
+ * get_file_info() - get the stat and absolute file path of the defrag target
+ *
+ * @file:		file name.
+ * @buf:		file info.
+ * @flag:		file type.
+ * @ftwbuf:		the pointer of a struct FTW.
+ */
+static int get_file_info(const char *file EXT2FS_ATTR((unused)),
+						 const struct stat64 *buf, int flag EXT2FS_ATTR((unused)),
+						 struct FTW *ftwbuf EXT2FS_ATTR((unused)))
+{
+	if (S_ISREG(buf->st_mode)) {
+		// copy file path
+		int len = strlen(file);
+		target_infos[f_cnt].f_path = (char *)malloc(len + 1);
+		strncpy(target_infos[f_cnt].f_path, file, len);
+		// copy stat structure
+		target_infos[f_cnt++].stat = *buf;
+	}
 
 	return 0;
 }
@@ -358,11 +408,11 @@ static int calc_entry_counts(const char *file EXT2FS_ATTR((unused)),
  * @page_num:		page number.
  */
 static int page_in_core(int fd, struct move_extent defrag_data,
-			unsigned char **vec, unsigned int *page_num)
+						unsigned char **vec, unsigned int *page_num)
 {
 	long	pagesize;
 	void	*page = NULL;
-	ext2_loff_t offset, end_offset, length;
+	loff_t	offset, end_offset, length;
 
 	if (vec == NULL || *vec != NULL)
 		return -1;
@@ -371,8 +421,8 @@ static int page_in_core(int fd, struct move_extent defrag_data,
 	if (pagesize < 0)
 		return -1;
 	/* In mmap, offset should be a multiple of the page size */
-	offset = (ext2_loff_t)defrag_data.orig_start * block_size;
-	length = (ext2_loff_t)defrag_data.len * block_size;
+	offset = (loff_t)defrag_data.orig_start * block_size;
+	length = (loff_t)defrag_data.len * block_size;
 	end_offset = offset + length;
 	/* Round the offset down to the nearest multiple of pagesize */
 	offset = (offset / pagesize) * pagesize;
@@ -409,27 +459,27 @@ static int page_in_core(int fd, struct move_extent defrag_data,
  * @page_num:		page number.
  */
 static int defrag_fadvise(int fd, struct move_extent defrag_data,
-		   unsigned char *vec, unsigned int page_num)
+						  unsigned char *vec, unsigned int page_num)
 {
 	int	flag = 1;
 	long	pagesize = sysconf(_SC_PAGESIZE);
 	int	fadvise_flag = POSIX_FADV_DONTNEED;
 	int	sync_flag = SYNC_FILE_RANGE_WAIT_BEFORE |
-			    SYNC_FILE_RANGE_WRITE |
-			    SYNC_FILE_RANGE_WAIT_AFTER;
+		SYNC_FILE_RANGE_WRITE |
+		SYNC_FILE_RANGE_WAIT_AFTER;
 	unsigned int	i;
-	ext2_loff_t	offset;
+	loff_t	offset;
 
 	if (pagesize < 1)
 		return -1;
 
-	offset = (ext2_loff_t)defrag_data.orig_start * block_size;
+	offset = (loff_t)defrag_data.orig_start * block_size;
 	offset = (offset / pagesize) * pagesize;
 
 #ifdef HAVE_SYNC_FILE_RANGE
 	/* Sync file for fadvise process */
 	if (sync_file_range(fd, offset,
-		(ext2_loff_t)pagesize * page_num, sync_flag) < 0)
+						(loff_t)pagesize * page_num, sync_flag) < 0)
 		return -1;
 #endif
 
@@ -441,8 +491,7 @@ static int defrag_fadvise(int fd, struct move_extent defrag_data,
 			offset += pagesize;
 			continue;
 		}
-		if ((errno = posix_fadvise(fd, offset,
-					   pagesize, fadvise_flag)) != 0) {
+		if (posix_fadvise(fd, offset, pagesize, fadvise_flag) < 0) {
 			if ((mode_flag & DETAIL) && flag) {
 				perror("\tFailed to fadvise");
 				flag = 0;
@@ -522,7 +571,7 @@ static int file_frag_count(int fd)
  * @blk_count:		file blocks.
  */
 static int file_check(int fd, const struct stat64 *buf, const char *file,
-		int extents, ext4_fsblk_t blk_count)
+					  int extents, ext4_fsblk_t blk_count)
 {
 	int	ret;
 	struct flock	lock;
@@ -538,10 +587,10 @@ static int file_check(int fd, const struct stat64 *buf, const char *file,
 	if (ret < 0) {
 		if ((mode_flag & DETAIL) && ret == -ENOSPC) {
 			printf("\033[79;0H\033[K[%u/%u] \"%s\"\t\t"
-				"  extents: %d -> %d\n", defraged_file_count,
-				total_count, file, extents, extents);
+				   "  extents: %d -> %d\n", defraged_file_count,
+				   total_count, file, extents, extents);
 			IN_FTW_PRINT_ERR_MSG(
-			"Defrag size is larger than filesystem's free space");
+				"Defrag size is larger than filesystem's free space");
 		}
 		return -1;
 	}
@@ -551,15 +600,14 @@ static int file_check(int fd, const struct stat64 *buf, const char *file,
 		buf->st_uid != current_uid) {
 		if (mode_flag & DETAIL) {
 			printf("\033[79;0H\033[K[%u/%u] \"%s\"\t\t"
-				"  extents: %d -> %d\n", defraged_file_count,
-				total_count, file, extents, extents);
+				   "  extents: %d -> %d\n", defraged_file_count,
+				   total_count, file, extents, extents);
 			IN_FTW_PRINT_ERR_MSG(
 				"File is not current user's file"
 				" or current user is not root");
 		}
 		return -1;
 	}
-
 	/* Lock status */
 	if (fcntl(fd, F_GETLK, &lock) < 0) {
 		if (mode_flag & DETAIL) {
@@ -575,7 +623,6 @@ static int file_check(int fd, const struct stat64 *buf, const char *file,
 		}
 		return -1;
 	}
-
 	return 0;
 }
 
@@ -586,7 +633,7 @@ static int file_check(int fd, const struct stat64 *buf, const char *file,
  * @ext:		the extent element which will be inserted.
  */
 static int insert_extent_by_logical(struct fiemap_extent_list **ext_list_head,
-			struct fiemap_extent_list *ext)
+									struct fiemap_extent_list *ext)
 {
 	struct fiemap_extent_list	*ext_list_tmp = *ext_list_head;
 
@@ -617,14 +664,14 @@ static int insert_extent_by_logical(struct fiemap_extent_list **ext_list_head,
 			ext_list_tmp = ext_list_tmp->next;
 		} while (ext_list_tmp != (*ext_list_head));
 		if (ext->data.logical <
-		    ext_list_tmp->prev->data.logical +
+			ext_list_tmp->prev->data.logical +
 			ext_list_tmp->prev->data.len)
 			/* Overlap */
 			goto out;
 
 		if (ext_list_tmp != *ext_list_head &&
-		    ext_list_tmp->data.logical <
-		    ext->data.logical + ext->data.len)
+			ext_list_tmp->data.logical <
+			ext->data.logical + ext->data.len)
 			/* Overlap */
 			goto out;
 	}
@@ -644,7 +691,7 @@ out:
  * @ext:		the extent element which will be inserted.
  */
 static int insert_extent_by_physical(struct fiemap_extent_list **ext_list_head,
-			struct fiemap_extent_list *ext)
+									 struct fiemap_extent_list *ext)
 {
 	struct fiemap_extent_list	*ext_list_tmp = *ext_list_head;
 
@@ -662,7 +709,7 @@ static int insert_extent_by_physical(struct fiemap_extent_list **ext_list_head,
 	if (ext->data.physical <= ext_list_tmp->data.physical) {
 		/* Insert before head */
 		if (ext_list_tmp->data.physical <
-					ext->data.physical + ext->data.len)
+			ext->data.physical + ext->data.len)
 			/* Overlap */
 			goto out;
 		/* Adjust head */
@@ -675,14 +722,14 @@ static int insert_extent_by_physical(struct fiemap_extent_list **ext_list_head,
 			ext_list_tmp = ext_list_tmp->next;
 		} while (ext_list_tmp != (*ext_list_head));
 		if (ext->data.physical <
-		    ext_list_tmp->prev->data.physical +
-				ext_list_tmp->prev->data.len)
+			ext_list_tmp->prev->data.physical +
+			ext_list_tmp->prev->data.len)
 			/* Overlap */
 			goto out;
 
 		if (ext_list_tmp != *ext_list_head &&
-		    ext_list_tmp->data.physical <
-				ext->data.physical + ext->data.len)
+			ext_list_tmp->data.physical <
+			ext->data.physical + ext->data.len)
 			/* Overlap */
 			goto out;
 	}
@@ -702,7 +749,7 @@ out:
  * @exts_group:			the exts_group element which will be inserted.
  */
 static int insert_exts_group(struct fiemap_extent_group **ext_group_head,
-				struct fiemap_extent_group *exts_group)
+							 struct fiemap_extent_group *exts_group)
 {
 	struct fiemap_extent_group	*ext_group_tmp = NULL;
 
@@ -732,8 +779,9 @@ static int insert_exts_group(struct fiemap_extent_group **ext_group_head,
  * @ext_group_head:		the head of the target exts_group list.
  */
 static int join_extents(struct fiemap_extent_list *ext_list_head,
-		struct fiemap_extent_group **ext_group_head)
+						struct fiemap_extent_group **ext_group_head)
 {
+
 	__u64	len = ext_list_head->data.len;
 	struct fiemap_extent_list *ext_list_start = ext_list_head;
 	struct fiemap_extent_list *ext_list_tmp = ext_list_head->next;
@@ -745,21 +793,21 @@ static int join_extents(struct fiemap_extent_list *ext_list_head,
 		 * so, all previous extents are treated as an extent group.
 		 */
 		if ((ext_list_tmp->prev->data.logical +
-			ext_list_tmp->prev->data.len)
-				!= ext_list_tmp->data.logical) {
+			 ext_list_tmp->prev->data.len)
+			!= ext_list_tmp->data.logical) {
 			ext_group_tmp =
 				malloc(sizeof(struct fiemap_extent_group));
 			if (ext_group_tmp == NULL)
 				return -1;
 
 			memset(ext_group_tmp, 0,
-				sizeof(struct fiemap_extent_group));
+				   sizeof(struct fiemap_extent_group));
 			ext_group_tmp->len = len;
 			ext_group_tmp->start = ext_list_start;
 			ext_group_tmp->end = ext_list_tmp->prev;
 
 			if (insert_exts_group(ext_group_head,
-				ext_group_tmp) < 0) {
+								  ext_group_tmp) < 0) {
 				FREE(ext_group_tmp);
 				return -1;
 			}
@@ -786,6 +834,23 @@ static int join_extents(struct fiemap_extent_list *ext_list_head,
  * @fd:			defrag target file's descriptor.
  * @ext_list_head:	the head of the extent list.
  */
+
+static int get_file_extents_internal(int fd, struct fiemap_extent_list **ext_list_head);
+static int get_file_extents_internal(int fd, struct fiemap_extent_list **ext_list_head)
+{
+	int ret;
+
+//struct timespec myclock[2];
+//clock_gettime(CLOCK_REALTIME,&myclock[0]);
+
+	get_file_extents_internal(fd, ext_list_head);
+
+//clock_gettime(CLOCK_REALTIME,&myclock[1]);
+//calclock(myclock,&get_extent_time, &get_extent_count);
+//printf(" \n get_file_extent :%llu \n",get_extent_time);
+
+	return ret;}
+
 static int get_file_extents(int fd, struct fiemap_extent_list **ext_list_head)
 {
 	__u32	i;
@@ -829,14 +894,14 @@ static int get_file_extents(int fd, struct fiemap_extent_list **ext_list_head)
 				goto out;
 
 			ext_list->data.physical = ext_buf[i].fe_physical
-						/ block_size;
+				/ block_size;
 			ext_list->data.logical = ext_buf[i].fe_logical
-						/ block_size;
+				/ block_size;
 			ext_list->data.len = ext_buf[i].fe_length
-						/ block_size;
+				/ block_size;
 
 			ret = insert_extent_by_physical(
-					ext_list_head, ext_list);
+				ext_list_head, ext_list);
 			if (ret < 0) {
 				FREE(ext_list);
 				goto out;
@@ -850,9 +915,9 @@ static int get_file_extents(int fd, struct fiemap_extent_list **ext_list_head)
 		 * there are extents left, continue to cycle.
 		 */
 	} while (fiemap_buf->fm_mapped_extents
-					== EXTENT_MAX_COUNT &&
-		!(ext_buf[EXTENT_MAX_COUNT-1].fe_flags
-					& FIEMAP_EXTENT_LAST));
+			 == EXTENT_MAX_COUNT &&
+			 !(ext_buf[EXTENT_MAX_COUNT-1].fe_flags
+			   & FIEMAP_EXTENT_LAST));
 
 	FREE(fiemap_buf);
 	return 0;
@@ -891,9 +956,9 @@ static int get_physical_count(struct fiemap_extent_list *physical_list_head)
 
 	do {
 		if ((ext_list_tmp->data.physical + ext_list_tmp->data.len)
-				!= ext_list_tmp->next->data.physical ||
-		    (ext_list_tmp->data.logical + ext_list_tmp->data.len)
-				!= ext_list_tmp->next->data.logical) {
+			!= ext_list_tmp->next->data.physical ||
+			(ext_list_tmp->data.logical + ext_list_tmp->data.len)
+			!= ext_list_tmp->next->data.logical) {
 			/* This extent and next extent are not continuous. */
 			ret++;
 		}
@@ -911,8 +976,8 @@ static int get_physical_count(struct fiemap_extent_list *physical_list_head)
  * @logical_list_head:	the head of logical extent list.
  */
 static int change_physical_to_logical(
-			struct fiemap_extent_list **physical_list_head,
-			struct fiemap_extent_list **logical_list_head)
+	struct fiemap_extent_list **physical_list_head,
+	struct fiemap_extent_list **logical_list_head)
 {
 	int ret;
 	struct fiemap_extent_list *ext_list_tmp = *physical_list_head;
@@ -1023,7 +1088,7 @@ static int get_best_count(ext4_fsblk_t block_count)
 	if (feature_incompat & EXT4_FEATURE_INCOMPAT_FLEX_BG) {
 		flex_bg_num = 1 << log_groups_per_flex;
 		ret = ((block_count - 1) /
-			((ext4_fsblk_t)blocks_per_group *
+			   ((ext4_fsblk_t)blocks_per_group *
 				flex_bg_num)) + 1;
 	} else
 		ret = ((block_count - 1) / blocks_per_group) + 1;
@@ -1041,8 +1106,8 @@ static int get_best_count(ext4_fsblk_t block_count)
  * @ftwbuf:		the pointer of a struct FTW.
  */
 static int file_statistic(const char *file, const struct stat64 *buf,
-			int flag EXT2FS_ATTR((unused)),
-			struct FTW *ftwbuf EXT2FS_ATTR((unused)))
+						  int flag EXT2FS_ATTR((unused)),
+						  struct FTW *ftwbuf EXT2FS_ATTR((unused)))
 {
 	int	fd;
 	int	ret;
@@ -1056,8 +1121,6 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 	struct fiemap_extent_list *logical_list_head = NULL;
 
 	defraged_file_count++;
-	if (defraged_file_count > total_count)
-		total_count = defraged_file_count;
 
 	if (mode_flag & DETAIL) {
 		if (total_count == 1 && regular_count == 1)
@@ -1068,12 +1131,12 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 		}
 	}
 	if (lost_found_dir[0] != '\0' &&
-	    !memcmp(file, lost_found_dir, strnlen(lost_found_dir, PATH_MAX))) {
+		!memcmp(file, lost_found_dir, strnlen(lost_found_dir, PATH_MAX))) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
 			STATISTIC_ERR_MSG(NGMSG_LOST_FOUND);
 		}
-			return 0;
+		return 0;
 	}
 
 	if (!S_ISREG(buf->st_mode)) {
@@ -1138,7 +1201,7 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 
 	/* Change list from physical to logical */
 	ret = change_physical_to_logical(&physical_list_head,
-							&logical_list_head);
+									 &logical_list_head);
 	if (ret < 0) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
@@ -1158,10 +1221,10 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 
 		/* e4defrag rounds size_per_ext up to a block size boundary */
 		size_per_ext = blk_count * (buf->st_blksize / 1024) /
-							now_ext_count;
+			now_ext_count;
 
 		ratio = (float)(physical_ext_count - best_ext_count) * 100 /
-							blk_count;
+			blk_count;
 
 		extents_before_defrag += now_ext_count;
 		extents_after_defrag += best_ext_count;
@@ -1173,45 +1236,40 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 		if (mode_flag & DETAIL) {
 			int count = 0;
 			struct fiemap_extent_list *ext_list_tmp =
-						logical_list_head;
+				logical_list_head;
 
 			/* Print extents info */
 			do {
 				count++;
 				printf("[ext %d]:\tstart %llu:\tlogical "
-				       "%llu:\tlen %llu\n", count,
-				       (unsigned long long)
-				       ext_list_tmp->data.physical,
-				       (unsigned long long)
-				       ext_list_tmp->data.logical,
-				       (unsigned long long)
-				       ext_list_tmp->data.len);
+					   "%llu:\tlen %llu\n", count,
+					   ext_list_tmp->data.physical,
+					   ext_list_tmp->data.logical,
+					   ext_list_tmp->data.len);
 				ext_list_tmp = ext_list_tmp->next;
 			} while (ext_list_tmp != logical_list_head);
 
 		} else {
 			printf("%-40s%10s/%-10s%9s\n",
-					"<File>", "now", "best", "size/ext");
+				   "<File>", "now", "best", "size/ext");
 			if (current_uid == ROOT_UID) {
 				if (strlen(file) > 40)
 					printf("%s\n%50d/%-10d%6llu KB\n",
-					       file, now_ext_count,
-					       best_ext_count,
-					       (unsigned long long) size_per_ext);
+						   file, now_ext_count,
+						   best_ext_count, size_per_ext);
 				else
 					printf("%-40s%10d/%-10d%6llu KB\n",
-					       file, now_ext_count,
-					       best_ext_count,
-					       (unsigned long long) size_per_ext);
+						   file, now_ext_count,
+						   best_ext_count, size_per_ext);
 			} else {
 				if (strlen(file) > 40)
 					printf("%s\n%50d/%-10s%7s\n",
-							file, now_ext_count,
-							"-", "-");
+						   file, now_ext_count,
+						   "-", "-");
 				else
 					printf("%-40s%10d/%-10s%7s\n",
-							file, now_ext_count,
-							"-", "-");
+						   file, now_ext_count,
+						   "-", "-");
 			}
 		}
 		succeed_cnt++;
@@ -1225,25 +1283,23 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 		if (current_uid == ROOT_UID) {
 			if (strlen(msg_buffer) > 40)
 				printf("\033[79;0H\033[K%s\n"
-				       "%50d/%-10d%6llu KB\n",
-				       msg_buffer, now_ext_count,
-				       best_ext_count,
-				       (unsigned long long) size_per_ext);
+					   "%50d/%-10d%6llu KB\n",
+					   msg_buffer, now_ext_count,
+					   best_ext_count, size_per_ext);
 			else
 				printf("\033[79;0H\033[K%-40s"
-				       "%10d/%-10d%6llu KB\n",
-				       msg_buffer, now_ext_count,
-				       best_ext_count,
-				       (unsigned long long) size_per_ext);
+					   "%10d/%-10d%6llu KB\n",
+					   msg_buffer, now_ext_count,
+					   best_ext_count, size_per_ext);
 		} else {
 			if (strlen(msg_buffer) > 40)
 				printf("\033[79;0H\033[K%s\n%50d/%-10s%7s\n",
-						msg_buffer, now_ext_count,
-							"-", "-");
+					   msg_buffer, now_ext_count,
+					   "-", "-");
 			else
 				printf("\033[79;0H\033[K%-40s%10d/%-10s%7s\n",
-						msg_buffer, now_ext_count,
-							"-", "-");
+					   msg_buffer, now_ext_count,
+					   "-", "-");
 		}
 	}
 
@@ -1251,11 +1307,11 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 		if (ratio >= frag_rank[i].ratio) {
 			for (j = SHOW_FRAG_FILES - 1; j > i; j--) {
 				memset(&frag_rank[j], 0,
-					sizeof(struct frag_statistic_ino));
+					   sizeof(struct frag_statistic_ino));
 				strncpy(frag_rank[j].msg_buffer,
-					frag_rank[j - 1].msg_buffer,
-					strnlen(frag_rank[j - 1].msg_buffer,
-					PATH_MAX));
+						frag_rank[j - 1].msg_buffer,
+						strnlen(frag_rank[j - 1].msg_buffer,
+								PATH_MAX));
 				frag_rank[j].now_count =
 					frag_rank[j - 1].now_count;
 				frag_rank[j].best_count =
@@ -1266,9 +1322,9 @@ static int file_statistic(const char *file, const struct stat64 *buf,
 					frag_rank[j - 1].ratio;
 			}
 			memset(&frag_rank[i], 0,
-					sizeof(struct frag_statistic_ino));
+				   sizeof(struct frag_statistic_ino));
 			strncpy(frag_rank[i].msg_buffer, file,
-						strnlen(file, PATH_MAX));
+					strnlen(file, PATH_MAX));
 			frag_rank[i].now_count = now_ext_count;
 			frag_rank[i].best_count = best_ext_count;
 			frag_rank[i].size_per_ext = size_per_ext;
@@ -1293,12 +1349,11 @@ out:
  * @start:		logical offset for defrag target file
  * @file_size:		defrag target filesize
  */
-static void print_progress(const char *file, ext2_loff_t start,
-			   ext2_loff_t file_size)
+static void print_progress(const char *file, loff_t start, loff_t file_size)
 {
 	int percent = (start * 100) / file_size;
 	printf("\033[79;0H\033[K[%u/%u]%s:\t%3d%%",
-		defraged_file_count, total_count, file, min(percent, 100));
+		   defraged_file_count, total_count, file, min(percent, 100));
 	fflush(stdout);
 
 	return;
@@ -1313,10 +1368,30 @@ static void print_progress(const char *file, ext2_loff_t start,
  * @buf:			pointer of the struct stat64.
  * @ext_list_head:	head of the extent list.
  */
-static int call_defrag(int fd, int donor_fd, const char *file,
-	const struct stat64 *buf, struct fiemap_extent_list *ext_list_head)
+static int call_defrag_internal(int fd, int donor_fd, const char *file,
+								const struct stat64 *buf, struct fiemap_extent_list *ext_list_head);
+
+static int call_defrag_internal(int fd, int donor_fd, const char *file,
+								const struct stat64 *buf, struct fiemap_extent_list *ext_list_head)
 {
-	ext2_loff_t	start = 0;
+	int ret;
+//struct timespec myclock[2];
+//clock_gettime(CLOCK_REALTIME,&myclock[0]);
+
+	call_defrag_internal( fd,  donor_fd, file,buf, ext_list_head);
+
+//clock_gettime(CLOCK_REALTIME,&myclock[1]);
+//calclock(myclock,&call_time, &call_count);
+//printf(" \n call_defrag:%llu \n ",call_time);
+
+	return ret;
+}
+
+static int call_defrag(int fd, int donor_fd, const char *file,
+					   const struct stat64 *buf, struct fiemap_extent_list *ext_list_head)
+{
+	int i=0;
+	loff_t	start = 0;
 	unsigned int	page_num;
 	unsigned char	*vec = NULL;
 	int	defraged_ret = 0;
@@ -1328,7 +1403,7 @@ static int call_defrag(int fd, int donor_fd, const char *file,
 	move_data.donor_fd = donor_fd;
 
 	/* Print defrag progress */
-	print_progress(file, start, buf->st_size);
+	//print_progress(file, start, buf->st_size);
 
 	ext_list_tmp = ext_list_head;
 	do {
@@ -1343,7 +1418,7 @@ static int call_defrag(int fd, int donor_fd, const char *file,
 			if (mode_flag & DETAIL) {
 				printf("\n");
 				PRINT_ERR_MSG_WITH_ERRNO(
-						"Failed to get file map");
+					"Failed to get file map");
 			} else {
 				printf("\t[ NG ]\n");
 			}
@@ -1379,9 +1454,10 @@ static int call_defrag(int fd, int donor_fd, const char *file,
 					"EXT4_IOC_MOVE_EXT ioctl");
 				if (errno == ENOTTY)
 					printf("\tAt least 2.6.31-rc1 of "
-						"vanilla kernel is required\n");
+						   "vanilla kernel is required\n");
 			} else {
 				printf("\t[ NG ]\n");
+				//printf("I am here, line %d\n", __LINE__);
 			}
 			return -1;
 		}
@@ -1392,7 +1468,7 @@ static int call_defrag(int fd, int donor_fd, const char *file,
 		start = move_data.orig_start * buf->st_blksize;
 
 		/* Print defrag progress */
-		print_progress(file, start, buf->st_size);
+		//print_progress(file, start, buf->st_size);
 
 		/* End of file */
 		if (start >= buf->st_size)
@@ -1413,8 +1489,30 @@ static int call_defrag(int fd, int donor_fd, const char *file,
  * @ftwbuf:		the pointer of a struct FTW.
  */
 static int file_defrag(const char *file, const struct stat64 *buf,
-			int flag EXT2FS_ATTR((unused)),
-			struct FTW *ftwbuf EXT2FS_ATTR((unused)))
+					   int flag EXT2FS_ATTR((unused)),
+					   struct FTW *ftwbuf EXT2FS_ATTR((unused)));
+
+void *file_defrag_internal(void *passed_target_infos)
+{
+	struct defrag_target_info *target_infos= (struct defrag_target_info *)passed_target_infos;
+
+	int idx = __sync_fetch_and_add(&info_idx, 1);
+	while (idx <= regular_count - 1) {
+		char *file = target_infos[idx].f_path;
+		struct stat64 *buf = &(target_infos[idx].stat);
+
+		file_defrag(file, buf, FTW_F, NULL);
+
+		free(file);
+		idx = __sync_fetch_and_add(&info_idx, 1);
+	}
+
+	return NULL;
+}
+
+static int file_defrag(const char *file, const struct stat64 *buf,
+					   int flag EXT2FS_ATTR((unused)),
+					   struct FTW *ftwbuf EXT2FS_ATTR((unused)))
 {
 	int	fd;
 	int	donor_fd = -1;
@@ -1431,9 +1529,8 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 	struct fiemap_extent_group	*orig_group_head = NULL;
 	struct fiemap_extent_group	*orig_group_tmp = NULL;
 
-	defraged_file_count++;
-	if (defraged_file_count > total_count)
-		total_count = defraged_file_count;
+	//defraged_file_count++;
+	__sync_fetch_and_add(&defraged_file_count, 1);
 
 	if (mode_flag & DETAIL) {
 		printf("[%u/%u]", defraged_file_count, total_count);
@@ -1441,7 +1538,7 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 	}
 
 	if (lost_found_dir[0] != '\0' &&
-	    !memcmp(file, lost_found_dir, strnlen(lost_found_dir, PATH_MAX))) {
+		!memcmp(file, lost_found_dir, strnlen(lost_found_dir, PATH_MAX))) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
 			IN_FTW_PRINT_ERR_MSG(NGMSG_LOST_FOUND);
@@ -1479,6 +1576,7 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 	if (fd < 0) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
+			//printf("\n fd open 64\n");
 			PRINT_ERR_MSG_WITH_ERRNO(NGMSG_FILE_OPEN);
 		}
 		return 0;
@@ -1499,7 +1597,7 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 
 	/* Change list from physical to logical */
 	ret = change_physical_to_logical(&orig_list_physical,
-							&orig_list_logical);
+									 &orig_list_logical);
 	if (ret < 0) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
@@ -1527,7 +1625,6 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 
 	if (file_frags_start <= best)
 		goto check_improvement;
-
 	/* Combine extents to group */
 	ret = join_extents(orig_list_logical, &orig_group_head);
 	if (ret < 0) {
@@ -1541,15 +1638,16 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 	/* Create donor inode */
 	memset(tmp_inode_name, 0, PATH_MAX + 8);
 	sprintf(tmp_inode_name, "%.*s.defrag",
-				(int)strnlen(file, PATH_MAX), file);
+			(int)strnlen(file, PATH_MAX), file);
 	donor_fd = open64(tmp_inode_name, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR);
 	if (donor_fd < 0) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
 			if (errno == EEXIST)
 				PRINT_ERR_MSG_WITH_ERRNO(
-				"File is being defraged by other program");
+					"File is being defraged by other program");
 			else
+//printf("\ndonor_fd open64\n");
 				PRINT_ERR_MSG_WITH_ERRNO(NGMSG_FILE_OPEN);
 		}
 		goto out;
@@ -1569,8 +1667,8 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 	orig_group_tmp = orig_group_head;
 	do {
 		ret = fallocate64(donor_fd, 0,
-		  (ext2_loff_t)orig_group_tmp->start->data.logical * block_size,
-		  (ext2_loff_t)orig_group_tmp->len * block_size);
+						  (loff_t)orig_group_tmp->start->data.logical * block_size,
+						  (loff_t)orig_group_tmp->len * block_size);
 		if (ret < 0) {
 			if (mode_flag & DETAIL) {
 				PRINT_FILE_NAME(file);
@@ -1597,7 +1695,7 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 
 	/* Change donor extent list from physical to logical */
 	ret = change_physical_to_logical(&donor_list_physical,
-							&donor_list_logical);
+									 &donor_list_logical);
 	if (ret < 0) {
 		if (mode_flag & DETAIL) {
 			PRINT_FILE_NAME(file);
@@ -1609,29 +1707,33 @@ static int file_defrag(const char *file, const struct stat64 *buf,
 check_improvement:
 	if (mode_flag & DETAIL) {
 		if (file_frags_start != 1)
-			frag_files_before_defrag++;
+			//frag_files_before_defrag++;
+			__sync_fetch_and_add(&frag_files_before_defrag, 1);
 
-		extents_before_defrag += file_frags_start;
+		//extents_before_defrag += file_frags_start;
+		__sync_fetch_and_add(&extents_before_defrag, frag_files_before_defrag);
 	}
-
-	if (file_frags_start <= best ||
-			orig_physical_cnt <= donor_physical_cnt) {
-		printf("\033[79;0H\033[K[%u/%u]%s:\t%3d%%",
-			defraged_file_count, total_count, file, 100);
+	if (file_frags_start <= best||
+		orig_physical_cnt <= donor_physical_cnt) {
+		//printf("\033[79;0H\033[K[%u/%u]%s:\t%3d%%",
+		//	   defraged_file_count, total_count, file, 100);
 		if (mode_flag & DETAIL)
 			printf("  extents: %d -> %d",
-				file_frags_start, file_frags_start);
+				   file_frags_start, file_frags_start);
 
-		printf("\t[ OK ]\n");
-		succeed_cnt++;
-
+		//printf("\t[ OK ]\n");
+	
+		//succeed_cnt++;
+		__sync_fetch_and_add(&succeed_cnt, 1);
 		if (file_frags_start != 1)
-			frag_files_after_defrag++;
+			__sync_fetch_and_add(&frag_files_after_defrag, 1);
+			//frag_files_after_defrag++;
 
-		extents_after_defrag += file_frags_start;
+		//extents_after_defrag += file_frags_start;
+		__sync_fetch_and_add(&extents_after_defrag, frag_files_after_defrag);
+
 		goto out;
 	}
-
 	/* Defrag the file */
 	ret = call_defrag(fd, donor_fd, file, buf, donor_list_logical);
 
@@ -1645,24 +1747,27 @@ check_improvement:
 		}
 
 		if (file_frags_end != 1)
-			frag_files_after_defrag++;
+			__sync_fetch_and_add(&frag_files_after_defrag, 1);
+			//frag_files_after_defrag++;
 
-		extents_after_defrag += file_frags_end;
+		__sync_fetch_and_add(&extents_after_defrag, file_frags_end);
+		//extents_after_defrag += file_frags_end;
 
 		if (ret < 0)
 			goto out;
 
 		printf("  extents: %d -> %d",
-			file_frags_start, file_frags_end);
+			   file_frags_start, file_frags_end);
 		fflush(stdout);
 	}
 
 	if (ret < 0)
 		goto out;
 
-	printf("\t[ OK ]\n");
+	//printf("\t[ OK ]\n");
 	fflush(stdout);
-	succeed_cnt++;
+	//succeed_cnt++;
+	__sync_fetch_and_add(&succeed_cnt, 1);
 
 out:
 	close(fd);
@@ -1681,11 +1786,34 @@ out:
  * @argc:		the number of parameter.
  * @argv[]:		the pointer array of parameter.
  */
+//sysganda
+int main_internal(int argc, char *argv[]);
+
 int main(int argc, char *argv[])
+{
+	int ret;
+	option = 8;
+
+	unsigned long long call_defrag_time = 0;
+	unsigned long long call_defrag_count = 0;
+
+	struct timespec myclock[2];
+	clock_gettime(CLOCK_REALTIME,&myclock[0]);
+
+	main_internal(argc,&argv[0]);
+
+	clock_gettime(CLOCK_REALTIME,&myclock[1]);
+	calclock(myclock,&call_defrag_time, &call_defrag_count);
+	printf(" Defrag time :%llu\n", call_defrag_time);
+
+	return ret;
+}
+
+int main_internal(int argc, char *argv[])
 {
 	int	opt;
 	int	i, j, ret = 0;
-	int	flags = FTW_PHYS | FTW_MOUNT;
+	int	flags = FTW_PHYS | FTW_MOUNT;  // zgy: symbolic links are not followed; only call callback func on the same mounted filesystem
 	int	arg_type = -1;
 	int	mount_dir_len = 0;
 	int	success_flag = 0;
@@ -1694,22 +1822,25 @@ int main(int argc, char *argv[])
 	struct stat64	buf;
 	ext2_filsys fs = NULL;
 
-	printf("e4defrag %s (%s)\n", E2FSPROGS_VERSION, E2FSPROGS_DATE);
+	printf("parallel e4defrag %s (%s)\n", E2FSPROGS_VERSION, E2FSPROGS_DATE);
 
 	/* Parse arguments */
 	if (argc == 1)
 		goto out;
 
-	while ((opt = getopt(argc, argv, "vc")) != EOF) {
+	while ((opt = getopt(argc, argv, "vcp")) != EOF) {
 		switch (opt) {
-		case 'v':
-			mode_flag |= DETAIL;
-			break;
-		case 'c':
-			mode_flag |= STATISTIC;
-			break;
-		default:
-			goto out;
+			case 'v':
+				mode_flag |= DETAIL;
+				break;
+			case 'c':
+				mode_flag |= STATISTIC;
+				break;
+			case 'p':
+				mode_flag |= PARALLEL;
+				break;
+			default:
+				goto out;
 		}
 	}
 
@@ -1737,7 +1868,7 @@ int main(int argc, char *argv[])
 		memset(dev_name, 0, PATH_MAX + 1);
 		memset(lost_found_dir, 0, PATH_MAX + 1);
 		memset(frag_rank, 0,
-			sizeof(struct frag_statistic_ino) * SHOW_FRAG_FILES);
+			   sizeof(struct frag_statistic_ino) * SHOW_FRAG_FILES);
 
 		if ((mode_flag & STATISTIC) && i > optind)
 			printf("\n");
@@ -1748,6 +1879,9 @@ int main(int argc, char *argv[])
 		continue;
 #endif
 
+		// zgy: read the stat of the given path
+		// if the given path is a symbolic link, lstat return stat of that link
+		// instread of the of the linked real file
 		if (lstat64(argv[i], &buf) < 0) {
 			perror(NGMSG_FILE_INFO);
 			PRINT_FILE_NAME(argv[i]);
@@ -1755,11 +1889,13 @@ int main(int argc, char *argv[])
 		}
 
 		/* Handle i.e. lvm device symlinks */
+		/* zgy: S_ISLNK is a macro that help us to know if the given path
+		 * is a real one or a link */
 		if (S_ISLNK(buf.st_mode)) {
 			struct stat64	buf2;
-
+			/* zgy: stat() will follow the link to the real file */
 			if (stat64(argv[i], &buf2) == 0 &&
-			    S_ISBLK(buf2.st_mode))
+				S_ISBLK(buf2.st_mode))
 				buf = buf2;
 		}
 
@@ -1776,9 +1912,10 @@ int main(int argc, char *argv[])
 			arg_type = DEVNAME;
 			if (!(mode_flag & STATISTIC))
 				printf("ext4 defragmentation for device(%s)\n",
-					argv[i]);
-		} else if (S_ISDIR(buf.st_mode)) {
+					   argv[i]);
+		} else if (S_ISDIR(buf.st_mode)) {  // zgy: we focus on this first
 			/* Directory */
+			/* zgy: check if we have the permission to get into the directory */
 			if (access(argv[i], R_OK) < 0) {
 				perror(argv[i]);
 				continue;
@@ -1797,12 +1934,20 @@ int main(int argc, char *argv[])
 
 		/* Set blocksize */
 		block_size = buf.st_blksize;
+		// zgy: add a new arg_type for parallel defrag
+		//if (option == 'p')
+		if (mode_flag & PARALLEL)
+			arg_type = FILE_PARALLEL;
+
+		//debug
+		printf("zgy: have checked the given path.\n");
 
 		/* For device case,
 		 * filesystem type checked in get_mount_point()
 		 */
-		if (arg_type == FILENAME || arg_type == DIRNAME) {
-			if (is_ext4(argv[i], dev_name) < 0)
+		// zgy: also added the option that we created here because is_ext4() gives dev_name
+		if (arg_type == FILENAME || arg_type == DIRNAME || arg_type == FILE_PARALLEL) {
+			if (is_ext4(argv[i], dev_name) < 0)  // zgy: get dev_name here
 				continue;
 			if (realpath(argv[i], dir_name) == NULL) {
 				perror("Couldn't get full path");
@@ -1814,13 +1959,13 @@ int main(int argc, char *argv[])
 		if (current_uid == ROOT_UID) {
 			/* Get super block info */
 			ret = ext2fs_open(dev_name, EXT2_FLAG_64BITS, 0,
-					  block_size, unix_io_manager, &fs);
+							  block_size, unix_io_manager, &fs);
 			if (ret) {
 				if (mode_flag & DETAIL)
 					fprintf(stderr,
-						"Warning: couldn't get file "
-						"system details for %s: %s\n",
-						dev_name, error_message(ret));
+							"Warning: couldn't get file "
+							"system details for %s: %s\n",
+							dev_name, error_message(ret));
 			} else {
 				blocks_per_group = fs->super->s_blocks_per_group;
 				feature_incompat = fs->super->s_feature_incompat;
@@ -1829,152 +1974,215 @@ int main(int argc, char *argv[])
 			}
 		}
 
+		// debug
+		//printf("zgy: before arg_type checking\n");
+
 		switch (arg_type) {
 
-		case DIRNAME:
-			if (!(mode_flag & STATISTIC))
-				printf("ext4 defragmentation "
-					"for directory(%s)\n", argv[i]);
+			case DIRNAME:
+				if (!(mode_flag & STATISTIC))
+					printf("ext4 defragmentation "
+						   "for directory(%s)\n", argv[i]);
 
-			mount_dir_len = strnlen(lost_found_dir, PATH_MAX);
+				mount_dir_len = strnlen(lost_found_dir, PATH_MAX);
 
-			strncat(lost_found_dir, "/lost+found",
-				PATH_MAX - strnlen(lost_found_dir, PATH_MAX));
+				/* zgy: the previous lost_found_dir actually is mount directory */
+				strncat(lost_found_dir, "/lost+found",
+						PATH_MAX - strnlen(lost_found_dir, PATH_MAX));
 
-			/* Not the case("e4defrag  mount_point_dir") */
-			if (dir_name[mount_dir_len] != '\0') {
-				/*
-				 * "e4defrag mount_point_dir/lost+found"
-				 * or "e4defrag mount_point_dir/lost+found/"
-				 */
+				/* Not the case("e4defrag  mount_point_dir") */
+				if (dir_name[mount_dir_len] != '\0') {
+					/*
+					 * "e4defrag mount_point_dir/lost+found"
+					 * or "e4defrag mount_point_dir/lost+found/"
+					 */
+					if (strncmp(lost_found_dir, dir_name,
+								strnlen(lost_found_dir,
+										PATH_MAX)) == 0 &&
+						(dir_name[strnlen(lost_found_dir,
+										  PATH_MAX)] == '\0' ||
+						 dir_name[strnlen(lost_found_dir,
+										  PATH_MAX)] == '/')) {
+						PRINT_ERR_MSG(NGMSG_LOST_FOUND);
+						PRINT_FILE_NAME(argv[i]);
+						continue;
+					}
+
+					/* "e4defrag mount_point_dir/else_dir" */
+					memset(lost_found_dir, 0, PATH_MAX + 1);
+				}
+	
+				/* fall through !! */
+			case DEVNAME:
+				if (arg_type == DEVNAME) {
+					strncpy(lost_found_dir, dir_name,
+							strnlen(dir_name, PATH_MAX));
+					strncat(lost_found_dir, "/lost+found/",
+							PATH_MAX - strnlen(lost_found_dir,
+											   PATH_MAX));
+				}
+				// zgy: FTW_OPEN_FD is the number of descripters that we can use, which is 2000
+				nftw64(dir_name, calc_entry_counts, FTW_OPEN_FD, flags);
+
+				if (mode_flag & STATISTIC) {
+					if (mode_flag & DETAIL)
+						printf("%-40s%10s/%-10s%9s\n",
+							   "<File>", "now", "best", "size/ext");
+
+					if (!(mode_flag & DETAIL) &&
+						current_uid != ROOT_UID) {
+						printf(" Done.\n");
+						success_flag = 1;
+						continue;
+					}
+
+					nftw64(dir_name, file_statistic,
+						   FTW_OPEN_FD, flags);
+
+					if (succeed_cnt != 0 &&
+						current_uid == ROOT_UID) {
+						if (mode_flag & DETAIL)
+							printf("\n");
+						printf("%-40s%10s/%-10s%9s\n",
+							   "<Fragmented files>", "now",
+							   "best", "size/ext");
+						for (j = 0; j < SHOW_FRAG_FILES; j++) {
+							if (strlen(frag_rank[j].
+									   msg_buffer) > 37) {
+								printf("%d. %s\n%50d/"
+									   "%-10d%6llu KB\n",
+									   j + 1,
+									   frag_rank[j].msg_buffer,
+									   frag_rank[j].now_count,
+									   frag_rank[j].best_count,
+									   frag_rank[j].
+									   size_per_ext);
+							} else if (strlen(frag_rank[j].
+											  msg_buffer) > 0) {
+								printf("%d. %-37s%10d/"
+									   "%-10d%6llu KB\n",
+									   j + 1,
+									   frag_rank[j].msg_buffer,
+									   frag_rank[j].now_count,
+									   frag_rank[j].best_count,
+									   frag_rank[j].
+									   size_per_ext);
+							} else
+								break;
+						}
+					}
+					break;
+				}
+
+				/* File tree walk */
+				/* zgy: defragmentation starts */
+				nftw64(dir_name, file_defrag, FTW_OPEN_FD, flags);
+				printf("\n\tSuccess:\t\t\t[ %u/%u ]\n",
+					   succeed_cnt, total_count);
+				printf("\tFailure:\t\t\t[ %u/%u ]\n",
+					   total_count - succeed_cnt, total_count);
+				if (mode_flag & DETAIL) {
+					printf("\tTotal extents:\t\t\t%4d->%d\n",
+						   extents_before_defrag,
+						   extents_after_defrag);
+					printf("\tFragmented percentage:\t\t"
+						   "%3u%%->%u%%\n",
+						   !regular_count ? 0 :
+						   (frag_files_before_defrag * 100) /
+						   regular_count,
+						   !regular_count ? 0 :
+						   (frag_files_after_defrag * 100) /
+						   regular_count);
+				}
+				break;
+			case FILENAME:
+				total_count = 1;
+				regular_count = 1;
+				strncat(lost_found_dir, "/lost+found/",
+						PATH_MAX - strnlen(lost_found_dir,
+										   PATH_MAX));
 				if (strncmp(lost_found_dir, dir_name,
-					    strnlen(lost_found_dir,
-						    PATH_MAX)) == 0 &&
-				    (dir_name[strnlen(lost_found_dir,
-						      PATH_MAX)] == '\0' ||
-				     dir_name[strnlen(lost_found_dir,
-						      PATH_MAX)] == '/')) {
+							strnlen(lost_found_dir,
+									PATH_MAX)) == 0) {
 					PRINT_ERR_MSG(NGMSG_LOST_FOUND);
 					PRINT_FILE_NAME(argv[i]);
 					continue;
 				}
 
-				/* "e4defrag mount_point_dir/else_dir" */
-				memset(lost_found_dir, 0, PATH_MAX + 1);
-			}
-			/* fall through */
-		case DEVNAME:
-			if (arg_type == DEVNAME) {
-				strncpy(lost_found_dir, dir_name,
-					strnlen(dir_name, PATH_MAX));
+				if (mode_flag & STATISTIC) {
+					file_statistic(argv[i], &buf, FTW_F, NULL);
+					break;
+				} else
+					printf("ext4 defragmentation for %s\n",
+						   argv[i]);
+				/* Defrag single file process */
+				file_defrag(argv[i], &buf, FTW_F, NULL);
+				if (succeed_cnt != 0)
+					printf(" Success:\t\t\t[1/1]\n");
+				else
+					printf(" Success:\t\t\t[0/1]\n");
+
+				break;
+
+				//zgy
+			case FILE_PARALLEL:
+				if (!(mode_flag & STATISTIC))
+					printf("ext4 defragmentation "
+						   "for directory(%s)\n", argv[i]);
+
+				mount_dir_len = strnlen(lost_found_dir, PATH_MAX);
+
+				/* zgy: the previous lost_found_dir actually is mount directory */
 				strncat(lost_found_dir, "/lost+found/",
-					PATH_MAX - strnlen(lost_found_dir,
-							   PATH_MAX));
-			}
-
-			nftw64(dir_name, calc_entry_counts, FTW_OPEN_FD, flags);
-
-			if (mode_flag & STATISTIC) {
-				if (mode_flag & DETAIL)
-					printf("%-40s%10s/%-10s%9s\n",
-					"<File>", "now", "best", "size/ext");
-
-				if (!(mode_flag & DETAIL) &&
-						current_uid != ROOT_UID) {
-					printf(" Done.\n");
-					success_flag = 1;
+						PATH_MAX - strnlen(lost_found_dir, PATH_MAX));
+				if (strncmp(lost_found_dir, dir_name,
+							strnlen(lost_found_dir,
+									PATH_MAX)) == 0) {
+					PRINT_ERR_MSG(NGMSG_LOST_FOUND);
+					PRINT_FILE_NAME(argv[i]);
 					continue;
 				}
 
-				nftw64(dir_name, file_statistic,
-							FTW_OPEN_FD, flags);
+				/* zgy: here we traverse the path tree to count the # of files under the give root */
+				nftw64(dir_name, calc_entry_counts, FTW_OPEN_FD, flags);
 
-				if (succeed_cnt != 0 &&
-					current_uid == ROOT_UID) {
-					if (mode_flag & DETAIL)
-						printf("\n");
-					printf("%-40s%10s/%-10s%9s\n",
-						"<Fragmented files>", "now",
-						"best", "size/ext");
-					for (j = 0; j < SHOW_FRAG_FILES; j++) {
-						if (strlen(frag_rank[j].
-							msg_buffer) > 37) {
-							printf("%d. %s\n%50d/"
-							"%-10d%6llu KB\n",
-							j + 1,
-							frag_rank[j].msg_buffer,
-							frag_rank[j].now_count,
-							frag_rank[j].best_count,
-							(unsigned long long)
-							frag_rank[j].
-								size_per_ext);
-						} else if (strlen(frag_rank[j].
-							msg_buffer) > 0) {
-							printf("%d. %-37s%10d/"
-							"%-10d%6llu KB\n",
-							j + 1,
-							frag_rank[j].msg_buffer,
-							frag_rank[j].now_count,
-							frag_rank[j].best_count,
-							(unsigned long long)
-							frag_rank[j].
-								size_per_ext);
-						} else
-							break;
-					}
+				if (mode_flag & STATISTIC) {
+					file_statistic(argv[i], &buf, FTW_F, NULL);
+					break;
+				} else {
+					printf("ext4 defragmentation for %s\n", argv[i]);
 				}
-				break;
-			}
-			/* File tree walk */
-			nftw64(dir_name, file_defrag, FTW_OPEN_FD, flags);
-			printf("\n\tSuccess:\t\t\t[ %u/%u ]\n", succeed_cnt,
-				total_count);
-			printf("\tFailure:\t\t\t[ %u/%u ]\n",
-				total_count - succeed_cnt, total_count);
-			if (mode_flag & DETAIL) {
-				printf("\tTotal extents:\t\t\t%4d->%d\n",
-					extents_before_defrag,
-					extents_after_defrag);
-				printf("\tFragmented percentage:\t\t"
-					"%3llu%%->%llu%%\n",
-					!regular_count ? 0 :
-					((unsigned long long)
-					frag_files_before_defrag * 100) /
-					regular_count,
-					!regular_count ? 0 :
-					((unsigned long long)
-					frag_files_after_defrag * 100) /
-					regular_count);
-			}
-			break;
-		case FILENAME:
-			total_count = 1;
-			regular_count = 1;
-			strncat(lost_found_dir, "/lost+found/",
-				PATH_MAX - strnlen(lost_found_dir,
-						   PATH_MAX));
-			if (strncmp(lost_found_dir, dir_name,
-				    strnlen(lost_found_dir,
-					    PATH_MAX)) == 0) {
-				PRINT_ERR_MSG(NGMSG_LOST_FOUND);
-				PRINT_FILE_NAME(argv[i]);
-				continue;
-			}
 
-			if (mode_flag & STATISTIC) {
-				file_statistic(argv[i], &buf, FTW_F, NULL);
-				break;
-			} else
-				printf("ext4 defragmentation for %s\n",
-								 argv[i]);
-			/* Defrag single file process */
-			file_defrag(argv[i], &buf, FTW_F, NULL);
-			if (succeed_cnt != 0)
-				printf(" Success:\t\t\t[1/1]\n");
-			else
-				printf(" Success:\t\t\t[0/1]\n");
+				/* Defrag single file process */
+#define THREAD_NUM 16
+				pthread_t p_thread[THREAD_NUM];
+				int thr_id[THREAD_NUM];
 
-			break;
+				f_cnt = 0;
+				info_idx = 0;
+
+				target_infos = (struct defrag_target_info*)malloc(sizeof(struct defrag_target_info) * regular_count);
+
+				/* Get target file info inadvance.
+				 * nftw() almost does most of the work for us.
+				 * It walks through the file tree and gives the absolute file path and corresponding stat to callback
+				 */
+				nftw64(dir_name, get_file_info, FTW_OPEN_FD, flags);
+
+				int j;
+				int thread_idx = 0;
+				int join_idx = 0;
+
+				for(j = 0; j < THREAD_NUM; j++) {
+					thr_id[j] = pthread_create(&p_thread[j], NULL, &file_defrag_internal, (void*)target_infos);
+				}
+
+				for(j = 0; j < THREAD_NUM; j++){
+					if(thr_id[j] == 0)
+						pthread_join(p_thread[j], NULL);
+				}
+
+				FREE(target_infos);
 		}
 
 		if (succeed_cnt != 0)
@@ -1991,39 +2199,39 @@ int main(int argc, char *argv[])
 
 				if (arg_type == DEVNAME)
 					printf(" In this device(%s), "
-					"none can be defragmented.\n", argv[i]);
+						   "none can be defragmented.\n", argv[i]);
 				else if (arg_type == DIRNAME)
 					printf(" In this directory(%s), "
-					"none can be defragmented.\n", argv[i]);
+						   "none can be defragmented.\n", argv[i]);
 				else
 					printf(" This file(%s) "
-					"can't be defragmented.\n", argv[i]);
+						   "can't be defragmented.\n", argv[i]);
 			} else {
 				float files_ratio = 0.0;
 				float score = 0.0;
 				__u64 size_per_ext = files_block_count *
-						(buf.st_blksize / 1024) /
-						extents_before_defrag;
+					(buf.st_blksize / 1024) /
+					extents_before_defrag;
 				files_ratio = (float)(extents_before_defrag -
-						extents_after_defrag) *
-						100 / files_block_count;
+									  extents_after_defrag) *
+					100 / files_block_count;
 				score = CALC_SCORE(files_ratio);
 				printf("\n Total/best extents\t\t\t\t%d/%d\n"
-				       " Average size per extent"
-				       "\t\t\t%llu KB\n"
-				       " Fragmentation score\t\t\t\t%.0f\n",
-				       extents_before_defrag,
-				       extents_after_defrag,
-				       (unsigned long long) size_per_ext, score);
+					   " Average size per extent"
+					   "\t\t\t%llu KB\n"
+					   " Fragmentation score\t\t\t\t%.0f\n",
+					   extents_before_defrag,
+					   extents_after_defrag,
+					   size_per_ext, score);
 				printf(" [0-30 no problem:"
-					" 31-55 a little bit fragmented:"
-					" 56- needs defrag]\n");
+					   " 31-55 a little bit fragmented:"
+					   " 56- needs defrag]\n");
 
 				if (arg_type == DEVNAME)
 					printf(" This device (%s) ", argv[i]);
 				else if (arg_type == DIRNAME)
 					printf(" This directory (%s) ",
-								argv[i]);
+						   argv[i]);
 				else
 					printf(" This file (%s) ", argv[i]);
 
@@ -2031,13 +2239,13 @@ int main(int argc, char *argv[])
 					printf("needs defragmentation.\n");
 				else
 					printf("does not need "
-							"defragmentation.\n");
+						   "defragmentation.\n");
 			}
 			printf(" Done.\n");
 		}
 
 	}
-
+	printf("\n %u", arg_type);
 	if (success_flag)
 		return 0;
 
@@ -2045,6 +2253,9 @@ int main(int argc, char *argv[])
 
 out:
 	printf(MSG_USAGE);
+	printf("\n %u",arg_type);
 	exit(1);
 }
+
+
 
