@@ -8,9 +8,9 @@
 #include <linux/fs.h>
 #include <linux/quotaops.h>
 #include <linux/slab.h>
-#include "pxt4_jbd3.h"
-#include "pxt4.h"
-#include "pxt4_extents.h"
+#include "ext4_jbd2.h"
+#include "ext4.h"
+#include "ext4_extents.h"
 
 /**
  * get_ext_path() - Find an extent path for designated logical block number.
@@ -18,20 +18,20 @@
  * @lblock:	logical block number to find an extent path
  * @ppath:	pointer to an extent path pointer (for output)
  *
- * pxt4_find_extent wrapper. Return 0 on success, or a negative error value
+ * ext4_find_extent wrapper. Return 0 on success, or a negative error value
  * on failure.
  */
 static inline int
-get_ext_path(struct inode *inode, pxt4_lblk_t lblock,
-		struct pxt4_ext_path **ppath)
+get_ext_path(struct inode *inode, ext4_lblk_t lblock,
+		struct ext4_ext_path **ppath)
 {
-	struct pxt4_ext_path *path;
+	struct ext4_ext_path *path;
 
-	path = pxt4_find_extent(inode, lblock, ppath, PXT4_EX_NOCACHE);
+	path = ext4_find_extent(inode, lblock, ppath, EXT4_EX_NOCACHE);
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 	if (path[ext_depth(inode)].p_ext == NULL) {
-		pxt4_ext_drop_refs(path);
+		ext4_ext_drop_refs(path);
 		kfree(path);
 		*ppath = NULL;
 		return -ENODATA;
@@ -41,38 +41,38 @@ get_ext_path(struct inode *inode, pxt4_lblk_t lblock,
 }
 
 /**
- * pxt4_double_down_write_data_sem() - write lock two inodes's i_data_sem
+ * ext4_double_down_write_data_sem() - write lock two inodes's i_data_sem
  * @first: inode to be locked
  * @second: inode to be locked
  *
  * Acquire write lock of i_data_sem of the two inodes
  */
 void
-pxt4_double_down_write_data_sem(struct inode *first, struct inode *second)
+ext4_double_down_write_data_sem(struct inode *first, struct inode *second)
 {
 	if (first < second) {
-		down_write(&PXT4_I(first)->i_data_sem);
-		down_write_nested(&PXT4_I(second)->i_data_sem, I_DATA_SEM_OTHER);
+		down_write(&EXT4_I(first)->i_data_sem);
+		down_write_nested(&EXT4_I(second)->i_data_sem, I_DATA_SEM_OTHER);
 	} else {
-		down_write(&PXT4_I(second)->i_data_sem);
-		down_write_nested(&PXT4_I(first)->i_data_sem, I_DATA_SEM_OTHER);
+		down_write(&EXT4_I(second)->i_data_sem);
+		down_write_nested(&EXT4_I(first)->i_data_sem, I_DATA_SEM_OTHER);
 
 	}
 }
 
 /**
- * pxt4_double_up_write_data_sem - Release two inodes' write lock of i_data_sem
+ * ext4_double_up_write_data_sem - Release two inodes' write lock of i_data_sem
  *
  * @orig_inode:		original inode structure to be released its lock first
  * @donor_inode:	donor inode structure to be released its lock second
  * Release write lock of i_data_sem of two inodes (orig and donor).
  */
 void
-pxt4_double_up_write_data_sem(struct inode *orig_inode,
+ext4_double_up_write_data_sem(struct inode *orig_inode,
 			      struct inode *donor_inode)
 {
-	up_write(&PXT4_I(orig_inode)->i_data_sem);
-	up_write(&PXT4_I(donor_inode)->i_data_sem);
+	up_write(&EXT4_I(orig_inode)->i_data_sem);
+	up_write(&EXT4_I(donor_inode)->i_data_sem);
 }
 
 /**
@@ -87,26 +87,26 @@ pxt4_double_up_write_data_sem(struct inode *orig_inode,
  * Return 1 if all extents in range has expected type, and zero otherwise.
  */
 static int
-mext_check_coverage(struct inode *inode, pxt4_lblk_t from, pxt4_lblk_t count,
+mext_check_coverage(struct inode *inode, ext4_lblk_t from, ext4_lblk_t count,
 		    int unwritten, int *err)
 {
-	struct pxt4_ext_path *path = NULL;
-	struct pxt4_extent *ext;
+	struct ext4_ext_path *path = NULL;
+	struct ext4_extent *ext;
 	int ret = 0;
-	pxt4_lblk_t last = from + count;
+	ext4_lblk_t last = from + count;
 	while (from < last) {
 		*err = get_ext_path(inode, from, &path);
 		if (*err)
 			goto out;
 		ext = path[ext_depth(inode)].p_ext;
-		if (unwritten != pxt4_ext_is_unwritten(ext))
+		if (unwritten != ext4_ext_is_unwritten(ext))
 			goto out;
-		from += pxt4_ext_get_actual_len(ext);
-		pxt4_ext_drop_refs(path);
+		from += ext4_ext_get_actual_len(ext);
+		ext4_ext_drop_refs(path);
 	}
 	ret = 1;
 out:
-	pxt4_ext_drop_refs(path);
+	ext4_ext_drop_refs(path);
 	kfree(path);
 	return ret;
 }
@@ -194,7 +194,7 @@ mext_page_mkuptodate(struct page *page, unsigned from, unsigned to)
 		if (buffer_uptodate(bh))
 			continue;
 		if (!buffer_mapped(bh)) {
-			err = pxt4_get_block(inode, block, bh, 0);
+			err = ext4_get_block(inode, block, bh, 0);
 			if (err) {
 				SetPageError(page);
 				return err;
@@ -226,86 +226,6 @@ out:
 	return 0;
 }
 
-/* Force page buffers uptodate w/o dropping page's lock */
-static int
-mext_page_mkuptodate_nowait(struct page *page, unsigned from, unsigned to,
-							struct buffer_head **bhpp, int *idx)
-{
-	struct inode *inode = page->mapping->host;
-	sector_t block;
-	struct buffer_head *bh, *head, *arr[MAX_BUF_PER_PAGE];
-	unsigned int blocksize, block_start, block_end;
-	int i, err,  nr = 0, partial = 0;
-	BUG_ON(!PageLocked(page));
-	BUG_ON(PageWriteback(page));
-
-	if (PageUptodate(page)) // ziggy: data in page and disk are the same
-		return 0;
-
-	blocksize = i_blocksize(inode);
-	if (!page_has_buffers(page))
-		create_empty_buffers(page, blocksize, 0);
-
-	head = page_buffers(page);
-	// ziggy: the logical block that we used to generate the page index
-	block = (sector_t)page->index << (PAGE_SHIFT - inode->i_blkbits);
-	for (bh = head, block_start = 0; bh != head || !block_start;
-	     block++, block_start = block_end, bh = bh->b_this_page) {
-		block_end = block_start + blocksize;
-		if (block_end <= from || block_start >= to) {
-			if (!buffer_uptodate(bh))
-				partial = 1;
-			continue;
-		}
-		if (buffer_uptodate(bh))
-			continue;
-		if (!buffer_mapped(bh)) {
-			err = pxt4_get_block(inode, block, bh, 0);
-			if (err) {
-				SetPageError(page);
-				return err;
-			}
-			if (!buffer_mapped(bh)) {
-				zero_user(page, block_start, blocksize);
-				set_buffer_uptodate(bh);
-				continue;
-			}
-		}
-		BUG_ON(nr >= MAX_BUF_PER_PAGE);
-		arr[nr++] = bh;
-	}
-	/* No io required */
-	if (!nr)
-		goto out;
-
-	// ziggy: bh in arr[] are blocks that do not in memory.
-	for (i = 0; i < nr; i++) {
-		bh = arr[i];
-		if (!bh_uptodate_or_lock(bh)) {
-			BUG_ON(!buffer_locked(bh));
-
-			if (buffer_uptodate(bh)) {
-				unlock_buffer(bh);
-				//return 0;
-				continue;
-			}
-
-			get_bh(bh);
-			bh->b_end_io = end_buffer_read_sync;
-			submit_bh(REQ_OP_READ, 0, bh);
-
-			bhpp[*idx] = bh;
-			(*idx)++;
-
-			if (err)
-				return err;
-		}
-	}
-out:
-	if (!partial)
-		SetPageUptodate(page);
-	return 0;
-}
 /**
  * move_extent_per_page - Move extent data per page
  *
@@ -319,7 +239,7 @@ out:
  * @err:			pointer to save return value
  *
  * Save the data in original inode blocks and replace original inode extents
- * with donor inode extents by calling pxt4_swap_extents().
+ * with donor inode extents by calling ext4_swap_extents().
  * Finally, write out the saved data in new original inode blocks. Return
  * replaced block count.
  */
@@ -332,7 +252,7 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
 	struct inode *orig_inode = file_inode(o_filp);
 	struct page *pagep[2] = {NULL, NULL};
 	handle_t *handle;
-	pxt4_lblk_t orig_blk_offset, donor_blk_offset;
+	ext4_lblk_t orig_blk_offset, donor_blk_offset;
 	unsigned long blocksize = orig_inode->i_sb->s_blocksize;
 	unsigned int tmp_data_size, data_size, replaced_size;
 	int i, err2, jblocks, retries = 0;
@@ -348,8 +268,8 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
 	 */
 again:
 	*err = 0;
-	jblocks = pxt4_writepage_trans_blocks(orig_inode) * 2;
-	handle = pxt4_journal_start(orig_inode, PXT4_HT_MOVE_EXTENTS, jblocks);
+	jblocks = ext4_writepage_trans_blocks(orig_inode) * 2;
+	handle = ext4_journal_start(orig_inode, EXT4_HT_MOVE_EXTENTS, jblocks);
 	if (IS_ERR(handle)) {
 		*err = PTR_ERR(handle);
 		return 0;
@@ -392,7 +312,7 @@ again:
 	 * necessary, just swap data blocks between orig and donor.
 	 */
 	if (unwritten) {
-		pxt4_double_down_write_data_sem(orig_inode, donor_inode);
+		ext4_double_down_write_data_sem(orig_inode, donor_inode);
 		/* If any of extents in range became initialized we have to
 		 * fallback to data copying */
 		unwritten = mext_check_coverage(orig_inode, orig_blk_offset,
@@ -406,7 +326,7 @@ again:
 			goto drop_data_sem;
 
 		if (!unwritten) {
-			pxt4_double_up_write_data_sem(orig_inode, donor_inode);
+			ext4_double_up_write_data_sem(orig_inode, donor_inode);
 			goto data_copy;
 		}
 		if ((page_has_private(pagep[0]) &&
@@ -416,12 +336,12 @@ again:
 			*err = -EBUSY;
 			goto drop_data_sem;
 		}
-		replaced_count = pxt4_swap_extents(handle, orig_inode,
+		replaced_count = ext4_swap_extents(handle, orig_inode,
 						   donor_inode, orig_blk_offset,
 						   donor_blk_offset,
 						   block_len_in_page, 1, err);
 	drop_data_sem:
-		pxt4_double_up_write_data_sem(orig_inode, donor_inode);
+		ext4_double_up_write_data_sem(orig_inode, donor_inode);
 		goto unlock_pages;
 	}
 data_copy:
@@ -436,11 +356,11 @@ data_copy:
 		*err = -EBUSY;
 		goto unlock_pages;
 	}
-	pxt4_double_down_write_data_sem(orig_inode, donor_inode);
-	replaced_count = pxt4_swap_extents(handle, orig_inode, donor_inode,
+	ext4_double_down_write_data_sem(orig_inode, donor_inode);
+	replaced_count = ext4_swap_extents(handle, orig_inode, donor_inode,
 					       orig_blk_offset, donor_blk_offset,
 					   block_len_in_page, 1, err);
-	pxt4_double_up_write_data_sem(orig_inode, donor_inode);
+	ext4_double_up_write_data_sem(orig_inode, donor_inode);
 	if (*err) {
 		if (replaced_count) {
 			block_len_in_page = replaced_count;
@@ -457,7 +377,7 @@ data_copy:
 	for (i = 0; i < data_offset_in_page; i++)
 		bh = bh->b_this_page;
 	for (i = 0; i < block_len_in_page; i++) {
-		*err = pxt4_get_block(orig_inode, orig_blk_offset + i, bh, 0);
+		*err = ext4_get_block(orig_inode, orig_blk_offset + i, bh, 0);
 		if (*err < 0)
 			break;
 		bh = bh->b_this_page;
@@ -470,7 +390,7 @@ data_copy:
 
 	/* Even in case of data=writeback it is reasonable to pin
 	 * inode to transaction, to prevent unexpected data loss */
-	*err = pxt4_jbd3_inode_add_write(handle, orig_inode,
+	*err = ext4_jbd2_inode_add_write(handle, orig_inode,
 			(loff_t)orig_page_offset << PAGE_SHIFT, replaced_size);
 
 unlock_pages:
@@ -479,14 +399,14 @@ unlock_pages:
 	unlock_page(pagep[1]);
 	put_page(pagep[1]);
 stop_journal:
-	pxt4_journal_stop(handle);
+	ext4_journal_stop(handle);
 	if (*err == -ENOSPC &&
-	    pxt4_should_retry_alloc(sb, &retries))
+	    ext4_should_retry_alloc(sb, &retries))
 		goto again;
 	/* Buffer was busy because probably is pinned to journal transaction,
 	 * force transaction commit may help to free it. */
-	if (*err == -EBUSY && retries++ < 4 && PXT4_SB(sb)->s_journal &&
-	    jbd3_journal_force_commit_nested(PXT4_SB(sb)->s_journal))
+	if (*err == -EBUSY && retries++ < 4 && EXT4_SB(sb)->s_journal &&
+	    jbd2_journal_force_commit_nested(EXT4_SB(sb)->s_journal))
 		goto again;
 	return replaced_count;
 
@@ -496,235 +416,19 @@ repair_branches:
 	 * Extents are swapped already, but we are not able to copy data.
 	 * Try to swap extents to it's original places
 	 */
-	pxt4_double_down_write_data_sem(orig_inode, donor_inode);
-	replaced_count = pxt4_swap_extents(handle, donor_inode, orig_inode,
+	ext4_double_down_write_data_sem(orig_inode, donor_inode);
+	replaced_count = ext4_swap_extents(handle, donor_inode, orig_inode,
 					       orig_blk_offset, donor_blk_offset,
 					   block_len_in_page, 0, &err2);
-	pxt4_double_up_write_data_sem(orig_inode, donor_inode);
+	ext4_double_up_write_data_sem(orig_inode, donor_inode);
 	if (replaced_count != block_len_in_page) {
-		PXT4_ERROR_INODE_BLOCK(orig_inode, (sector_t)(orig_blk_offset),
+		EXT4_ERROR_INODE_BLOCK(orig_inode, (sector_t)(orig_blk_offset),
 				       "Unable to copy data block,"
 				       " data will be lost.");
 		*err = -EIO;
 	}
 	replaced_count = 0;
 	goto unlock_pages;
-}
-
-/**
- * move_extent_all_page - Move extent data in one time
- *
- * @o_filp:			file structure of original file
- * @donor_inode:		donor inode
- * @orig_page_offset:		page index on original file
- * @donor_page_offset:		page index on donor file
- * @data_offset_in_page:	block index where data swapping starts
- * @block_len_in_page:		the number of blocks to be swapped
- * @unwritten:			orig extent is unwritten or not
- * @err:			pointer to save return value
- *
- * Save the data in original inode blocks and replace original inode extents
- * with donor inode extents by calling pxt4_swap_extents().
- * Finally, write out the saved data in new original inode blocks. Return
- * replaced block count.
- */
-static int
-move_extent_all_page(struct file *o_filp, struct inode *donor_inode,
-					 pxt4_lblk_t o_start, pxt4_lblk_t o_end,
-					 pxt4_lblk_t d_start,
-					 int *err)
-{
-	struct inode *orig_inode = file_inode(o_filp);
-	handle_t *handle;
-	unsigned long blocksize = orig_inode->i_sb->s_blocksize;
-	unsigned int tmp_data_size, data_size, replaced_size;
-	int i, err2, jblocks, retries = 0;
-	int replaced_count = 0;
-	int blocks_per_page = PAGE_SIZE >> orig_inode->i_blkbits;
-	struct super_block *sb = orig_inode->i_sb;
-	struct buffer_head *bh = NULL;
-	struct pxt4_extent *ex;  // ziggy: extent on-disk structure
-	int unwritten;
-
-	struct pxt4_ext_path *path = NULL;
-	int ret;
-	int num_pages;
-	struct page **pagepp;
-	struct buffer_head **bhpp;
-	int idx_pagepp;
-	int idx_bhpp;
-
-	pxt4_lblk_t orig_start = o_start;
-
-	//ziggy: only works for one block per page
-	BUG_ON(blocks_per_page != 1);
-
-	ret = get_ext_path(orig_inode, o_start, &path);
-	if (ret)
-		goto free_path;
-	ex = path[path->p_depth].p_ext;  // ziggy: extent of target file
-	unwritten = pxt4_ext_is_unwritten(ex);
-
-	// ziggy: prealloc array for pages to read
-	//        this is ok, because in our system, page and block both are 4kb,
-	//        number_pages is accurate.
-	num_pages = (o_end - o_start) / blocks_per_page;
-	pagepp = (struct page **)kmalloc(sizeof(struct page *) * num_pages, GFP_KERNEL);
-	// TODO: only works for 4kb pages and blocks for now
-	bhpp = (struct buffer_head **)kmalloc(sizeof(struct buffer_head *) * num_pages, GFP_KERNEL);
-
-	*err = 0;
-	jblocks = pxt4_writepage_trans_blocks(orig_inode) * num_pages;  // num_pages is also the number of blks
-	handle = pxt4_journal_start(orig_inode, PXT4_HT_MOVE_EXTENTS, jblocks);
-	if (IS_ERR(handle)) {
-		*err = PTR_ERR(handle);
-		goto stop_journal;
-	}
-
-	int num_total_blk = num_pages * blocks_per_page;  // our code can only handle num_blks == num_pages for now
-
-	/*
-	 * Current extent is preallocated, which is empty.
-	 * We do not need move data, simply change the mapping relation
-	 * is enough.
-	 */
-	if (unwritten) {
-		pxt4_double_down_write_data_sem(orig_inode, donor_inode);
-
-		replaced_count = pxt4_swap_extents(handle, orig_inode, donor_inode,
-							o_start, d_start,
-						num_total_blk, 1, err);
-
-		pxt4_double_up_write_data_sem(orig_inode, donor_inode);
-		goto stop_journal;
-	}
-
-	idx_pagepp = 0;
-	while (o_start < o_end) {  // ziggy: get page by index. From inode or from page cache
-		pxt4_lblk_t cur_blk, next_blk;
-		pgoff_t orig_page_index, donor_page_index;
-		int offset_in_page;
-		int unwritten, cur_len;
-
-		ret = get_ext_path(orig_inode, o_start, &path);
-		if (ret)
-			goto unlock_pages;
-		ex = path[path->p_depth].p_ext;  // ziggy: extent of target file
-		next_blk = pxt4_ext_next_allocated_block(path);
-		cur_blk = le32_to_cpu(ex->ee_block);  // ziggy: start logical blocks
-		cur_len = pxt4_ext_get_actual_len(ex);
-		/* Check hole before the start pos */
-		if (cur_blk + cur_len - 1 < o_start) {
-			if (next_blk == EXT_MAX_BLOCKS) {
-				o_start = o_end;
-				ret = -ENODATA;
-				goto unlock_pages;
-			}
-			d_start += next_blk - o_start;
-			o_start = next_blk;
-			continue;
-		/* Check hole after the start pos */
-		} else if (cur_blk > o_start) {
-			/* Skip hole */
-			d_start += cur_blk - o_start;
-			o_start = cur_blk;
-			/* Extent inside requested range ?*/
-			if (cur_blk >= o_end)
-				goto unlock_pages;
-		} else { /* in_range(o_start, o_blk, o_len) */
-			cur_len += cur_blk - o_start;
-		}
-
-		if (o_end - o_start < cur_len)
-			cur_len = o_end - o_start;
-
-		orig_page_index = o_start >> (PAGE_SHIFT -
-					       orig_inode->i_blkbits);
-		donor_page_index = d_start >> (PAGE_SHIFT -
-					       donor_inode->i_blkbits);
-		offset_in_page = o_start % blocks_per_page;
-		if (cur_len > blocks_per_page- offset_in_page)
-			cur_len = blocks_per_page - offset_in_page;  // ziggy: length must less than a page, in our situation, one block per page.
-
-		struct address_space *mapping = orig_inode->i_mapping;
-		pagepp[idx_pagepp] = grab_cache_page_write_begin(mapping, orig_page_index, AOP_FLAG_NOFS);
-		wait_on_page_writeback(pagepp[idx_pagepp]);
-		if (!pagepp[idx_pagepp]) {
-			idx_pagepp++;  // to simplify the code, even error happends idx still point to next free slot
-			goto unlock_pages;
-		}
-		idx_pagepp++;
-
-		o_start += cur_len;
-		d_start += cur_len;
-	}
-
-	idx_bhpp = 0;
-	for (i = 0; i < idx_pagepp; i++) {
-		*err = mext_page_mkuptodate_nowait(pagepp[i], 0, blocksize, bhpp, &idx_bhpp);
-		if (*err)
-			goto unlock_pages;
-	}
-	// wait for read completion
-	for (i = 0; i < idx_bhpp; i++) {
-			wait_on_buffer(bhpp[i]);
-			if (buffer_uptodate(bhpp[i]))
-				continue;
-	}
-
-	/* At this point all buffers in range are uptodate, old mapping layout
-	 * is no longer required, try to drop it now. */
-	for (i = 0; i < num_pages; i++) {
-		if (page_has_private(pagepp[i]) && !try_to_release_page(pagepp[i], 0)) {
-			*err = -EBUSY;
-			goto unlock_pages;
-		}
-	}
-
-	pxt4_double_down_write_data_sem(orig_inode, donor_inode);
-	replaced_count = pxt4_swap_extents(handle, orig_inode, donor_inode,
-					       orig_start, orig_start,
-					  num_total_blk, 1, err);
-	pxt4_double_up_write_data_sem(orig_inode, donor_inode);
-	if (*err) {
-		if (replaced_count) {
-			replaced_size = replaced_count << orig_inode->i_blkbits;
-		} else
-			goto unlock_pages;
-	}
-
-	/* Perform all necessary steps similar write_begin()/write_end()
-	 * but keeping in mind that i_size will not change */
-	for (i = 0; i < num_pages; i++) {
-
-		if (!page_has_buffers(pagepp[i]))
-			create_empty_buffers(pagepp[i], 1 << orig_inode->i_blkbits, 0);
-		bh = page_buffers(pagepp[i]);
-
-			*err = pxt4_get_block(orig_inode, 0, bh, 0);
-			if (*err < 0)
-				break;
-			bh = bh->b_this_page;
-		if (!*err)
-			*err = block_commit_write(pagepp[i], 0, blocksize);
-	}
-	*err = pxt4_jbd3_inode_add_write(handle, orig_inode,
-			(loff_t)orig_start << PAGE_SHIFT, replaced_count << orig_inode->i_blkbits);
-
-unlock_pages:
-	for (i = 0; i < idx_pagepp; i++) {
-		unlock_page(pagepp[i]);
-		put_page(pagepp[i]);
-	}
-stop_journal:  // last goto
-	pxt4_journal_stop(handle);
-free_arr:
-	kfree(pagepp);
-	kfree(bhpp);
-free_path:
-	pxt4_ext_drop_refs(path);
-	kfree(path);
-	return replaced_count;
 }
 
 /**
@@ -736,7 +440,7 @@ free_path:
  * @donor_start:	logical start offset in block for donor
  * @len:		the number of blocks to be moved
  *
- * Check the arguments of pxt4_move_extents() whether the files can be
+ * Check the arguments of ext4_move_extents() whether the files can be
  * exchanged with each other.
  * Return 0 on success, or a negative error value on failure.
  */
@@ -754,7 +458,7 @@ mext_check_arguments(struct inode *orig_inode,
 
 
 	if (donor_inode->i_mode & (S_ISUID|S_ISGID)) {
-		pxt4_debug("pxt4 move extent: suid or sgid is set"
+		ext4_debug("ext4 move extent: suid or sgid is set"
 			   " to donor file [ino:orig %lu, donor %lu]\n",
 			   orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -765,39 +469,39 @@ mext_check_arguments(struct inode *orig_inode,
 
 	/* Ext4 move extent does not support swapfile */
 	if (IS_SWAPFILE(orig_inode) || IS_SWAPFILE(donor_inode)) {
-		pxt4_debug("pxt4 move extent: The argument files should "
+		ext4_debug("ext4 move extent: The argument files should "
 			"not be swapfile [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EBUSY;
 	}
 
-	if (pxt4_is_quota_file(orig_inode) && pxt4_is_quota_file(donor_inode)) {
-		pxt4_debug("pxt4 move extent: The argument files should "
+	if (ext4_is_quota_file(orig_inode) && ext4_is_quota_file(donor_inode)) {
+		ext4_debug("ext4 move extent: The argument files should "
 			"not be quota files [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EBUSY;
 	}
 
 	/* Ext4 move extent supports only extent based file */
-	if (!(pxt4_test_inode_flag(orig_inode, PXT4_INODE_EXTENTS))) {
-		pxt4_debug("pxt4 move extent: orig file is not extents "
+	if (!(ext4_test_inode_flag(orig_inode, EXT4_INODE_EXTENTS))) {
+		ext4_debug("ext4 move extent: orig file is not extents "
 			"based file [ino:orig %lu]\n", orig_inode->i_ino);
 		return -EOPNOTSUPP;
-	} else if (!(pxt4_test_inode_flag(donor_inode, PXT4_INODE_EXTENTS))) {
-		pxt4_debug("pxt4 move extent: donor file is not extents "
+	} else if (!(ext4_test_inode_flag(donor_inode, EXT4_INODE_EXTENTS))) {
+		ext4_debug("ext4 move extent: donor file is not extents "
 			"based file [ino:donor %lu]\n", donor_inode->i_ino);
 		return -EOPNOTSUPP;
 	}
 
 	if ((!orig_inode->i_size) || (!donor_inode->i_size)) {
-		pxt4_debug("pxt4 move extent: File size is 0 byte\n");
+		ext4_debug("ext4 move extent: File size is 0 byte\n");
 		return -EINVAL;
 	}
 
 	/* Start offset should be same */
 	if ((orig_start & ~(PAGE_MASK >> orig_inode->i_blkbits)) !=
 	    (donor_start & ~(PAGE_MASK >> orig_inode->i_blkbits))) {
-		pxt4_debug("pxt4 move extent: orig and donor's start "
+		ext4_debug("ext4 move extent: orig and donor's start "
 			"offsets are not aligned [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -808,7 +512,7 @@ mext_check_arguments(struct inode *orig_inode,
 	    (*len > EXT_MAX_BLOCKS) ||
 	    (donor_start + *len >= EXT_MAX_BLOCKS) ||
 	    (orig_start + *len >= EXT_MAX_BLOCKS))  {
-		pxt4_debug("pxt4 move extent: Can't handle over [%u] blocks "
+		ext4_debug("ext4 move extent: Can't handle over [%u] blocks "
 			"[ino:orig %lu, donor %lu]\n", EXT_MAX_BLOCKS,
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -822,7 +526,7 @@ mext_check_arguments(struct inode *orig_inode,
 	else if (donor_eof < donor_start + *len - 1)
 		*len = donor_eof - donor_start;
 	if (!*len) {
-		pxt4_debug("pxt4 move extent: len should not be 0 "
+		ext4_debug("ext4 move extent: len should not be 0 "
 			"[ino:orig %lu, donor %lu]\n", orig_inode->i_ino,
 			donor_inode->i_ino);
 		return -EINVAL;
@@ -832,7 +536,7 @@ mext_check_arguments(struct inode *orig_inode,
 }
 
 /**
- * pxt4_move_extents - Exchange the specified range of a file
+ * ext4_move_extents - Exchange the specified range of a file
  *
  * @o_filp:		file structure of the original file
  * @d_filp:		file structure of the donor file
@@ -846,19 +550,19 @@ mext_check_arguments(struct inode *orig_inode,
  *
  */
 int
-pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
+ext4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 		  __u64 donor_blk, __u64 len, __u64 *moved_len)
 {
 	struct inode *orig_inode = file_inode(o_filp);
 	struct inode *donor_inode = file_inode(d_filp);
-	struct pxt4_ext_path *path = NULL;
+	struct ext4_ext_path *path = NULL;
 	int blocks_per_page = PAGE_SIZE >> orig_inode->i_blkbits;
-	pxt4_lblk_t o_end, o_start = orig_blk;
-	pxt4_lblk_t d_start = donor_blk;
+	ext4_lblk_t o_end, o_start = orig_blk;
+	ext4_lblk_t d_start = donor_blk;
 	int ret;
 
 	if (orig_inode->i_sb != donor_inode->i_sb) {
-		pxt4_debug("pxt4 move extent: The argument files "
+		ext4_debug("ext4 move extent: The argument files "
 			"should be in same FS [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -866,7 +570,7 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 
 	/* orig and donor should be different inodes */
 	if (orig_inode == donor_inode) {
-		pxt4_debug("pxt4 move extent: The argument files should not "
+		ext4_debug("ext4 move extent: The argument files should not "
 			"be same inode [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -874,7 +578,7 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 
 	/* Regular file check */
 	if (!S_ISREG(orig_inode->i_mode) || !S_ISREG(donor_inode->i_mode)) {
-		pxt4_debug("pxt4 move extent: The argument files should be "
+		ext4_debug("ext4 move extent: The argument files should be "
 			"regular file [ino:orig %lu, donor %lu]\n",
 			orig_inode->i_ino, donor_inode->i_ino);
 		return -EINVAL;
@@ -882,20 +586,21 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 
 	/* TODO: it's not obvious how to swap blocks for inodes with full
 	   journaling enabled */
-	if (pxt4_should_journal_data(orig_inode) ||
-	    pxt4_should_journal_data(donor_inode)) {
-		pxt4_msg(orig_inode->i_sb, KERN_ERR,
+	if (ext4_should_journal_data(orig_inode) ||
+	    ext4_should_journal_data(donor_inode)) {
+		ext4_msg(orig_inode->i_sb, KERN_ERR,
 			 "Online defrag not supported with data journaling");
 		return -EOPNOTSUPP;
 	}
 
 	if (IS_ENCRYPTED(orig_inode) || IS_ENCRYPTED(donor_inode)) {
-		pxt4_msg(orig_inode->i_sb, KERN_ERR,
+		ext4_msg(orig_inode->i_sb, KERN_ERR,
 			 "Online defrag not supported for encrypted files");
 		return -EOPNOTSUPP;
 	}
 
 	/* Protect orig and donor inodes against a truncate */
+	// ziggy: down write i_rwsem of these inodes
 	lock_two_nondirectories(orig_inode, donor_inode);
 
 	/* Wait for all existing dio workers */
@@ -903,7 +608,8 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 	inode_dio_wait(donor_inode);
 
 	/* Protect extent tree against block allocations via delalloc */
-	pxt4_double_down_write_data_sem(orig_inode, donor_inode);
+	// ziggy: down write i_data_sem
+	ext4_double_down_write_data_sem(orig_inode, donor_inode);
 	/* Check the filesystem environment whether move_extent can be done */
 	ret = mext_check_arguments(orig_inode, donor_inode, orig_blk,
 				    donor_blk, &len);
@@ -912,8 +618,8 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 	o_end = o_start + len;
 
 	while (o_start < o_end) {
-		struct pxt4_extent *ex;
-		pxt4_lblk_t cur_blk, next_blk;
+		struct ext4_extent *ex;
+		ext4_lblk_t cur_blk, next_blk;
 		pgoff_t orig_page_index, donor_page_index;
 		int offset_in_page;
 		int unwritten, cur_len;
@@ -922,9 +628,9 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 		if (ret)
 			goto out;
 		ex = path[path->p_depth].p_ext;
-		next_blk = pxt4_ext_next_allocated_block(path);
+		next_blk = ext4_ext_next_allocated_block(path);
 		cur_blk = le32_to_cpu(ex->ee_block);
-		cur_len = pxt4_ext_get_actual_len(ex);
+		cur_len = ext4_ext_get_actual_len(ex);
 		/* Check hole before the start pos */
 		if (cur_blk + cur_len - 1 < o_start) {
 			if (next_blk == EXT_MAX_BLOCKS) {
@@ -946,7 +652,7 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 		} else { /* in_range(o_start, o_blk, o_len) */
 			cur_len += cur_blk - o_start;
 		}
-		unwritten = pxt4_ext_is_unwritten(ex);
+		unwritten = ext4_ext_is_unwritten(ex);
 		if (o_end - o_start < cur_len)
 			cur_len = o_end - o_start;
 
@@ -959,18 +665,18 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 			cur_len = blocks_per_page - offset_in_page;
 		/*
 		 * Up semaphore to avoid following problems:
-		 * a. transaction deadlock among pxt4_journal_start,
-		 *    ->write_begin via pagefault, and jbd3_journal_commit
-		 * b. racing with ->readpage, ->write_begin, and pxt4_get_block
+		 * a. transaction deadlock among ext4_journal_start,
+		 *    ->write_begin via pagefault, and jbd2_journal_commit
+		 * b. racing with ->readpage, ->write_begin, and ext4_get_block
 		 *    in move_extent_per_page
 		 */
-		pxt4_double_up_write_data_sem(orig_inode, donor_inode);
+		ext4_double_up_write_data_sem(orig_inode, donor_inode);
 		/* Swap original branches with new branches */
 		move_extent_per_page(o_filp, donor_inode,
 				     orig_page_index, donor_page_index,
 				     offset_in_page, cur_len,
 				     unwritten, &ret);
-		pxt4_double_down_write_data_sem(orig_inode, donor_inode);
+		ext4_double_down_write_data_sem(orig_inode, donor_inode);
 		if (ret < 0)
 			break;
 		o_start += cur_len;
@@ -982,113 +688,13 @@ pxt4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 
 out:
 	if (*moved_len) {
-		pxt4_discard_preallocations(orig_inode);
-		pxt4_discard_preallocations(donor_inode);
+		ext4_discard_preallocations(orig_inode);
+		ext4_discard_preallocations(donor_inode);
 	}
 
-	pxt4_ext_drop_refs(path);
+	ext4_ext_drop_refs(path);
 	kfree(path);
-	pxt4_double_up_write_data_sem(orig_inode, donor_inode);
-	unlock_two_nondirectories(orig_inode, donor_inode);
-
-	return ret;
-}
-
-/**
- * pxt4_move_extents_async - Exchange the specified range of a file
- *
- * @o_filp:		file structure of the original file
- * @d_filp:		file structure of the donor file
- * @orig_blk:		start offset in block for orig
- * @donor_blk:		start offset in block for donor
- * @len:		the number of blocks to be moved
- * @moved_len:		moved block length
- *
- * This function returns 0 and moved block length is set in moved_len
- * if succeed, otherwise returns error value.
- *
- */
-int
-pxt4_move_extents_async(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
-		  __u64 donor_blk, __u64 len, __u64 *moved_len)
-{
-	struct inode *orig_inode = file_inode(o_filp);
-	struct inode *donor_inode = file_inode(d_filp);
-	struct pxt4_ext_path *path = NULL;
-	int blocks_per_page = PAGE_SIZE >> orig_inode->i_blkbits;
-	pxt4_lblk_t o_end, o_start = orig_blk;
-	pxt4_lblk_t d_start = donor_blk;
-	int ret;
-
-	if (orig_inode->i_sb != donor_inode->i_sb) {
-		pxt4_debug("pxt4 move extent: The argument files "
-			"should be in same FS [ino:orig %lu, donor %lu]\n",
-			orig_inode->i_ino, donor_inode->i_ino);
-		return -EINVAL;
-	}
-
-	/* orig and donor should be different inodes */
-	if (orig_inode == donor_inode) {
-		pxt4_debug("pxt4 move extent: The argument files should not "
-			"be same inode [ino:orig %lu, donor %lu]\n",
-			orig_inode->i_ino, donor_inode->i_ino);
-		return -EINVAL;
-	}
-
-	/* Regular file check */
-	if (!S_ISREG(orig_inode->i_mode) || !S_ISREG(donor_inode->i_mode)) {
-		pxt4_debug("pxt4 move extent: The argument files should be "
-			"regular file [ino:orig %lu, donor %lu]\n",
-			orig_inode->i_ino, donor_inode->i_ino);
-		return -EINVAL;
-	}
-
-	/* TODO: it's not obvious how to swap blocks for inodes with full
-	   journaling enabled */
-	if (pxt4_should_journal_data(orig_inode) ||
-	    pxt4_should_journal_data(donor_inode)) {
-		pxt4_msg(orig_inode->i_sb, KERN_ERR,
-			 "Online defrag not supported with data journaling");
-		return -EOPNOTSUPP;
-	}
-
-	if (IS_ENCRYPTED(orig_inode) || IS_ENCRYPTED(donor_inode)) {
-		pxt4_msg(orig_inode->i_sb, KERN_ERR,
-			 "Online defrag not supported for encrypted files");
-		return -EOPNOTSUPP;
-	}
-
-	/* Protect orig and donor inodes against a truncate */
-	lock_two_nondirectories(orig_inode, donor_inode);
-
-	/* Wait for all existing dio workers */
-	inode_dio_wait(orig_inode);
-	inode_dio_wait(donor_inode);
-
-	/* Protect extent tree against block allocations via delalloc */
-	pxt4_double_down_write_data_sem(orig_inode, donor_inode);
-	/* Check the filesystem environment whether move_extent can be done */
-	ret = mext_check_arguments(orig_inode, donor_inode, orig_blk,
-				    donor_blk, &len);
-	pxt4_double_up_write_data_sem(orig_inode, donor_inode);
-
-	if (ret)
-		goto out;
-	o_end = o_start + len;
-
-	move_extent_all_page(o_filp, donor_inode,
-						 o_start, o_end,
-						 d_start,
-						 &ret);
-	// END
-		*moved_len = len;
-
-out:
-	if (*moved_len) {
-		pxt4_discard_preallocations(orig_inode);
-		pxt4_discard_preallocations(donor_inode);
-	}
-
+	ext4_double_up_write_data_sem(orig_inode, donor_inode);
 	unlock_two_nondirectories(orig_inode, donor_inode);
 
 	return ret;
