@@ -600,7 +600,6 @@ ext4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 	}
 
 	/* Protect orig and donor inodes against a truncate */
-	// ziggy: down write i_rwsem of these inodes
 	lock_two_nondirectories(orig_inode, donor_inode);
 
 	/* Wait for all existing dio workers */
@@ -608,7 +607,6 @@ ext4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 	inode_dio_wait(donor_inode);
 
 	/* Protect extent tree against block allocations via delalloc */
-	// ziggy: down write i_data_sem
 	ext4_double_down_write_data_sem(orig_inode, donor_inode);
 	/* Check the filesystem environment whether move_extent can be done */
 	ret = mext_check_arguments(orig_inode, donor_inode, orig_blk,
